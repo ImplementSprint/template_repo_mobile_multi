@@ -1,4 +1,4 @@
-name: "Master Pipeline Caller – Mobile Multi"
+name: "Master Pipeline Caller — Mobile Multi"
 
 on:
   push:
@@ -32,6 +32,7 @@ concurrency:
 
 jobs:
   master-orchestrator:
+    if: ${{ github.event.repository.name != 'central-workflow' }}
     name: "Call Mobile Master Orchestrator"
     uses: ImplementSprint/central-workflow/.github/workflows/master-pipeline-mb-multi.yml@main
     with:
