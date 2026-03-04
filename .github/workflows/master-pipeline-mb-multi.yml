@@ -34,7 +34,7 @@ jobs:
   master-orchestrator:
     if: ${{ github.event.repository.name != 'central-workflow' }}
     name: "Call Mobile Master Orchestrator"
-    uses: ImplementSprint/central-workflow/.github/workflows/master-pipeline-mb-multi.yml@main
+    uses: ImplementSprint/central-workflow/.github/workflows/master-pipeline-mobile.yml@main
     with:
       run_deploy: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.run_deploy == 'true' }}
       run_promotion: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.run_promotion == 'true' }}
