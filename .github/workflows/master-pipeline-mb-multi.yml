@@ -25,6 +25,9 @@ permissions:
   packages: write
   pull-requests: write
   security-events: write
+  actions: read
+  checks: read
+  statuses: read
 
 concurrency:
   group: master-pipeline-mobile-multi-caller-${{ github.ref }}
