@@ -1,7 +1,3 @@
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║  MASTER PIPELINE ORCHESTRATOR (MOBILE SINGLE)                  ║
-# ║  Branch Strategy: test → uat → main                             ║
-# ╚══════════════════════════════════════════════════════════════════╝
 name: "Master Pipeline Orchestrator — MB Single"
 
 on:
@@ -20,7 +16,21 @@ on:
         type: boolean
         default: true
       dry_run:
-        description: "Preview-only mode (skip deploy/tag push)"
+        description: "Preview-only mode (skip deploy/tag push, print PR body)"
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      run_deploy:
+        description: "Run deploy jobs"
+        type: boolean
+        default: true
+      run_promotion:
+        description: "Run PR promotion jobs"
+        type: boolean
+        default: true
+      dry_run:
+        description: "Preview-only mode (skip deploy/tag push, print PR body)"
         type: boolean
         default: false
 
@@ -35,127 +45,424 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ══════════════════════════════════════════════════════════════════
-  # Detect Changes
-  # ══════════════════════════════════════════════════════════════════
-  detect-changes:
-    name: "Detect Changed Files"
+  systems-config:
+    name: "Resolve Systems Configuration"
     runs-on: ubuntu-latest
     outputs:
-      mobile: ${{ steps.filter.outputs.mobile }}
-      shared: ${{ steps.filter.outputs.shared }}
+      systems_json: ${{ steps.resolve.outputs.systems_json }}
+      systems_label: ${{ steps.resolve.outputs.systems_label }}
+    steps:
+      - name: Resolve systems JSON
+        id: resolve
+        env:
+          MB_SINGLE_SYSTEMS_JSON_VAR: ${{ vars.MB_SINGLE_SYSTEMS_JSON }}
+          MB_MULTI_SYSTEMS_JSON_VAR: ${{ vars.MB_MULTI_SYSTEMS_JSON }}
+          MB_SYSTEM_NAME_VAR: ${{ vars.MB_SYSTEM_NAME }}
+        run: |
+          SYSTEMS_JSON_VAR="${MB_SINGLE_SYSTEMS_JSON_VAR}"
+          if [ -z "${SYSTEMS_JSON_VAR}" ]; then
+            SYSTEMS_JSON_VAR="${MB_MULTI_SYSTEMS_JSON_VAR}"
+          fi
+
+          if [ -z "${SYSTEMS_JSON_VAR}" ]; then
+            FALLBACK_NAME="${MB_SYSTEM_NAME_VAR}"
+            if [ -z "${FALLBACK_NAME}" ]; then
+              FALLBACK_NAME="Mobile-Single"
+            fi
+
+            SYSTEMS_JSON_VAR=$(jq -cn --arg name "${FALLBACK_NAME}" '[{name:$name, dir:"."}]')
+          fi
+
+          echo "${SYSTEMS_JSON_VAR}" | jq -e . >/dev/null
+
+          SYSTEMS_JSON_TYPE=$(echo "${SYSTEMS_JSON_VAR}" | jq -r 'type')
+          if [ "${SYSTEMS_JSON_TYPE}" = "object" ]; then
+            SYSTEMS_JSON=$(echo "${SYSTEMS_JSON_VAR}" | jq -c '[.]')
+          elif [ "${SYSTEMS_JSON_TYPE}" = "array" ]; then
+            SYSTEMS_JSON=$(echo "${SYSTEMS_JSON_VAR}" | jq -c .)
+          else
+            echo "❌ MB systems JSON must be an object or array."
+            exit 1
+          fi
+
+          echo "${SYSTEMS_JSON}" | jq -e 'length > 0' >/dev/null
+          echo "${SYSTEMS_JSON}" | jq -e 'all(.[]; (.name|type=="string" and length>0) and ((.dir // ".")|type=="string" and length>0))' >/dev/null
+
+          SYSTEMS_JSON=$(echo "${SYSTEMS_JSON}" | jq -c 'map(. + { dir: (.dir // ".") })')
+          SYSTEMS_LABEL=$(echo "${SYSTEMS_JSON}" | jq -r 'map(.name) | join(", ")')
+
+          echo "systems_json=${SYSTEMS_JSON}" >> "$GITHUB_OUTPUT"
+          echo "systems_label=${SYSTEMS_LABEL}" >> "$GITHUB_OUTPUT"
+
+  active-systems:
+    name: "Detect Active Systems"
+    needs: [systems-config]
+    runs-on: ubuntu-latest
+    outputs:
+      active_systems_json: ${{ steps.select.outputs.active_systems_json }}
+      active_count: ${{ steps.select.outputs.active_count }}
+      active_label: ${{ steps.select.outputs.active_label }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Detect file changes
-        id: filter
-        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
-        with:
-          filters: |
-            mobile:
-              - '**'
-            shared:
-              - '.github/**'
-              - 'package.json'
-              - 'app.json'
-              - 'jest.config.js'
-
-  # ══════════════════════════════════════════════════════════════════
-  # Resolve MB Single Configuration
-  # ══════════════════════════════════════════════════════════════════
-  systems-config:
-    name: "Resolve MB Single Configuration"
-    runs-on: ubuntu-latest
-    outputs:
-      system_name: ${{ steps.resolve.outputs.system_name }}
-      working_dir: ${{ steps.resolve.outputs.working_dir }}
-      mobile_stack: ${{ steps.resolve.outputs.mobile_stack }}
-    steps:
-      - name: Resolve MB single config
-        id: resolve
+      - name: Select active systems
+        id: select
         env:
-          MB_SINGLE_SYSTEMS_JSON: ${{ vars.MB_SINGLE_SYSTEMS_JSON }}
+          SYSTEMS_JSON: ${{ needs.systems-config.outputs.systems_json }}
         run: |
-          if [ -z "${MB_SINGLE_SYSTEMS_JSON}" ]; then
-            echo "❌ Missing required repository variable MB_SINGLE_SYSTEMS_JSON."
-            exit 1
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "workflow_call" ]; then
+            ACTIVE="${SYSTEMS_JSON}"
+          else
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            else
+              BASE_SHA="${{ github.event.before }}"
+            fi
+
+            if [ -z "${BASE_SHA}" ] || [ "${BASE_SHA}" = "0000000000000000000000000000000000000000" ]; then
+              BASE_SHA=$(git rev-parse HEAD^ 2>/dev/null || git rev-parse HEAD)
+            fi
+
+            CHANGED_FILES=$(git diff --name-only "${BASE_SHA}" "${GITHUB_SHA}" || true)
+            CHANGED_JSON=$(printf "%s\n" "${CHANGED_FILES}" | sed '/^$/d' | jq -R . | jq -s .)
+            SYSTEM_DIRS_JSON=$(echo "${SYSTEMS_JSON}" | jq -c '[.[] | ((.dir // ".") | gsub("^\\./"; "")) | select(. != "" and . != ".")]')
+
+            SHARED_CHANGED=false
+            if printf "%s\n" "${CHANGED_FILES}" | grep -Eq '^(\.github/|package\.json$|app\.json$|eas\.json$|metro\.config\.)'; then
+              SHARED_CHANGED=true
+            elif echo "${CHANGED_JSON}" | jq -e --argjson dirs "${SYSTEM_DIRS_JSON}" '
+              any(.[]; . as $file | ([$dirs[]? | select($file | startswith(. + "/"))] | length) == 0)
+            ' >/dev/null; then
+              SHARED_CHANGED=true
+            fi
+
+            if [ "${SHARED_CHANGED}" = "true" ]; then
+              ACTIVE="${SYSTEMS_JSON}"
+            else
+              ACTIVE=$(echo "${SYSTEMS_JSON}" | jq -c --argjson changed "${CHANGED_JSON}" '
+                map(select(
+                  . as $system
+                  | (($system.dir // "." | gsub("^\\./"; "")) as $dir
+                    | if ($dir == "" or $dir == ".")
+                      then ($changed | length) > 0
+                      else any($changed[]; startswith($dir + "/"))
+                      end)
+                ))
+              ')
+            fi
           fi
 
-          CONFIG=$(echo "${MB_SINGLE_SYSTEMS_JSON}" | jq -c 'if type == "array" then .[0] else . end')
-          
-          SYSTEM_NAME=$(echo "${CONFIG}" | jq -r '.name')
-          WORKING_DIR=$(echo "${CONFIG}" | jq -r '.dir // "."')
-          MOBILE_STACK=$(echo "${CONFIG}" | jq -r '.mobile_stack // "react-native"')
+          ACTIVE=$(echo "${ACTIVE}" | jq -c '
+            map(
+              . + {
+                version_stream: (
+                  ((.version_stream // .name // .dir // "mobile") | ascii_downcase | gsub("[^a-z0-9]+"; "-") | gsub("(^-+|-+$)"; ""))
+                  | if length > 0 then . else "mobile" end
+                )
+              }
+            )
+          ')
 
-          echo "system_name=${SYSTEM_NAME}" >> "$GITHUB_OUTPUT"
-          echo "working_dir=${WORKING_DIR}" >> "$GITHUB_OUTPUT"
-          echo "mobile_stack=${MOBILE_STACK}" >> "$GITHUB_OUTPUT"
+          ACTIVE_COUNT=$(echo "${ACTIVE}" | jq 'length')
+          if [ "${ACTIVE_COUNT}" -gt 0 ]; then
+            ACTIVE_LABEL=$(echo "${ACTIVE}" | jq -r 'map(.name) | join(", ")')
+          else
+            ACTIVE_LABEL="None"
+          fi
 
-  # ══════════════════════════════════════════════════════════════════
-  # Mobile Pipeline Execution
-  # ══════════════════════════════════════════════════════════════════
-  mobile-pipeline:
-    name: "${{ needs.systems-config.outputs.system_name }} Pipeline"
-    needs: [detect-changes, systems-config]
-    if: needs.detect-changes.outputs.mobile == 'true' || needs.detect-changes.outputs.shared == 'true'
-    uses: ImplementSprint/central-workflow/.github/workflows/mobile-workflow.yml@main
+          echo "active_systems_json=${ACTIVE}" >> "$GITHUB_OUTPUT"
+          echo "active_count=${ACTIVE_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "active_label=${ACTIVE_LABEL}" >> "$GITHUB_OUTPUT"
+
+  mobile:
+    name: "Mobile — ${{ matrix.system.name }}"
+    needs: [active-systems]
+    if: fromJson(needs.active-systems.outputs.active_count) > 0
+    strategy:
+      fail-fast: false
+      matrix:
+        system: ${{ fromJson(needs.active-systems.outputs.active_systems_json) }}
+    uses: ./.github/workflows/mobile-workflow.yml
     with:
-      system-dir: ${{ needs.systems-config.outputs.working_dir }}
-      system-name: ${{ needs.systems-config.outputs.system_name }}
+      system-dir: ${{ matrix.system.dir }}
+      system-name: ${{ matrix.system.name }}
+      node-version: ${{ matrix.system.node_version || 20 }}
+      java-version: ${{ matrix.system.java_version || '17' }}
+      coverage-threshold: ${{ matrix.system.coverage_threshold || 80 }}
       enable-lint: true
       enable-security-scan: true
       enable-sonar: true
+      enable-governance: true
+      enable-gradle: true
+      gradle-task: ${{ matrix.system.gradle_task || 'assembleDebug' }}
       enable-detox: ${{ github.ref == 'refs/heads/uat' }}
+      detox-build-command: ${{ matrix.system.detox_build_command || 'npx detox build --configuration android.emu.debug' }}
+      detox-test-command: ${{ matrix.system.detox_test_command || 'npx detox test --configuration android.emu.debug --headless' }}
     secrets: inherit
 
-  # ══════════════════════════════════════════════════════════════════
-  # Versioning & Promotion (Mirroring FE Logic)
-  # ══════════════════════════════════════════════════════════════════
   version-test:
-    name: "Version Tag — TEST"
-    needs: [mobile-pipeline, systems-config]
-    if: always() && github.ref == 'refs/heads/test' && needs.mobile-pipeline.result == 'success'
-    uses: ImplementSprint/central-workflow/.github/workflows/versioning.yml@main
+    name: "Version Tag — TEST (${{ matrix.system.name }})"
+    needs: [mobile, active-systems]
+    if: >-
+      always() &&
+      github.ref == 'refs/heads/test' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') &&
+      ((github.event_name != 'workflow_dispatch' && github.event_name != 'workflow_call') || inputs.dry_run != true) &&
+      fromJson(needs.active-systems.outputs.active_count) > 0 &&
+      (needs.mobile.result == 'success' || needs.mobile.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        system: ${{ fromJson(needs.active-systems.outputs.active_systems_json) }}
+    uses: ./.github/workflows/versioning.yml
     with:
       mode: test
+      stream: ${{ matrix.system.version_stream }}
+
+  deploy-test:
+    name: "TEST — ${{ matrix.system.name }}"
+    needs: [mobile, active-systems]
+    if: >-
+      always() &&
+      github.ref == 'refs/heads/test' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') &&
+      ((github.event_name != 'workflow_dispatch' && github.event_name != 'workflow_call') || (inputs.run_deploy == true && inputs.dry_run != true)) &&
+      fromJson(needs.active-systems.outputs.active_count) > 0 &&
+      (needs.mobile.result == 'success' || needs.mobile.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        system: ${{ fromJson(needs.active-systems.outputs.active_systems_json) }}
+    uses: ./.github/workflows/deploy-staging.yml
+    with:
+      system-dir: ${{ matrix.system.dir }}
+      system-name: ${{ matrix.system.name }}
+      app-type: mobile
+      artifact-name: ${{ matrix.system.artifact_name || format('{0}-android-build', matrix.system.name) }}
+      deploy-environment: test
+      enable-health-check: false
+    secrets: inherit
+
+  deploy-uat:
+    name: "UAT — ${{ matrix.system.name }}"
+    needs: [mobile, active-systems]
+    if: >-
+      always() &&
+      github.ref == 'refs/heads/uat' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') &&
+      ((github.event_name != 'workflow_dispatch' && github.event_name != 'workflow_call') || (inputs.run_deploy == true && inputs.dry_run != true)) &&
+      fromJson(needs.active-systems.outputs.active_count) > 0 &&
+      (needs.mobile.result == 'success' || needs.mobile.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        system: ${{ fromJson(needs.active-systems.outputs.active_systems_json) }}
+    uses: ./.github/workflows/deploy-staging.yml
+    with:
+      system-dir: ${{ matrix.system.dir }}
+      system-name: ${{ matrix.system.name }}
+      app-type: mobile
+      artifact-name: ${{ matrix.system.artifact_name || format('{0}-android-build', matrix.system.name) }}
+      deploy-environment: uat
+      enable-health-check: false
+    secrets: inherit
+
+  production-gate:
+    name: "Production Readiness Gate"
+    needs: [mobile, active-systems]
+    if: >-
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') &&
+      ((github.event_name != 'workflow_dispatch' && github.event_name != 'workflow_call') || (inputs.run_deploy == true && inputs.dry_run != true)) &&
+      fromJson(needs.active-systems.outputs.active_count) > 0 &&
+      (needs.mobile.result == 'success' || needs.mobile.result == 'skipped')
+    uses: ./.github/workflows/production-gate.yml
+    with:
+      system-dir: ${{ needs.active-systems.outputs.active_label }}
+      app-type: mobile
+    secrets: inherit
+
+  deploy-prod:
+    name: "Prod — ${{ matrix.system.name }}"
+    needs: [production-gate, active-systems]
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.run_deploy == true && inputs.dry_run != true)) &&
+      fromJson(needs.active-systems.outputs.active_count) > 0
+    strategy:
+      fail-fast: false
+      matrix:
+        system: ${{ fromJson(needs.active-systems.outputs.active_systems_json) }}
+    uses: ./.github/workflows/deploy-staging.yml
+    with:
+      system-dir: ${{ matrix.system.dir }}
+      system-name: ${{ matrix.system.name }}
+      app-type: mobile
+      artifact-name: ${{ matrix.system.artifact_name || format('{0}-android-build', matrix.system.name) }}
+      deploy-environment: prod
+      enable-health-check: false
+    secrets: inherit
+
+  version-main-release:
+    name: "Version Tag — MAIN Release (${{ matrix.system.name }})"
+    needs: [deploy-prod, active-systems]
+    if: >-
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') &&
+      ((github.event_name != 'workflow_dispatch' && github.event_name != 'workflow_call') || inputs.dry_run != true) &&
+      fromJson(needs.active-systems.outputs.active_count) > 0 &&
+      (needs.deploy-prod.result == 'success' || needs.deploy-prod.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        system: ${{ fromJson(needs.active-systems.outputs.active_systems_json) }}
+    uses: ./.github/workflows/versioning.yml
+    with:
+      mode: main
+      stream: ${{ matrix.system.version_stream }}
+
+  prepare-payload:
+    name: "Prepare Promotion/Notify Payload"
+    needs: [active-systems, mobile]
+    if: fromJson(needs.active-systems.outputs.active_count) > 0
+    runs-on: ubuntu-latest
+    outputs:
+      deployment_urls_json: ${{ steps.payload.outputs.deployment_urls_json }}
+      results_json: ${{ steps.payload.outputs.results_json }}
+      versions_json: ${{ steps.payload.outputs.versions_json }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build payload JSON
+        id: payload
+        env:
+          SYSTEMS_JSON: ${{ needs.active-systems.outputs.active_systems_json }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MOBILE_RESULT: ${{ needs.mobile.result }}
+        run: |
+          DEPLOYMENT_URLS_JSON=$(echo "${SYSTEMS_JSON}" | jq -c --arg runUrl "${RUN_URL}" 'reduce .[] as $s ({}; .[$s.name] = $runUrl)')
+
+          RESULT_VALUE="${MOBILE_RESULT}"
+          if [ -z "${RESULT_VALUE}" ]; then
+            RESULT_VALUE="unknown"
+          fi
+          RESULTS_JSON=$(echo "${SYSTEMS_JSON}" | jq -c --arg value "${RESULT_VALUE}" 'reduce .[] as $s ({}; .[$s.name] = $value)')
+
+          VERSIONS_JSON='{}'
+          while IFS=$'\t' read -r NAME STREAM; do
+            if [ -z "${NAME}" ]; then
+              continue
+            fi
+
+            if [ -z "${STREAM}" ] || [ "${STREAM}" = "global" ]; then
+              PREFIX="test-v"
+            else
+              PREFIX="test-${STREAM}-v"
+            fi
+
+            TAG=$(git tag -l "${PREFIX}*" | grep -E "^${PREFIX}[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$" | sort -V | tail -n 1)
+            if [ -z "${TAG}" ]; then
+              TAG="N/A"
+            fi
+
+            VERSIONS_JSON=$(echo "${VERSIONS_JSON}" | jq -c --arg name "${NAME}" --arg tag "${TAG}" '. + {($name):$tag}')
+          done < <(echo "${SYSTEMS_JSON}" | jq -r '.[] | "\(.name)\t\(.version_stream // "global")"')
+
+          echo "deployment_urls_json=${DEPLOYMENT_URLS_JSON}" >> "$GITHUB_OUTPUT"
+          echo "results_json=${RESULTS_JSON}" >> "$GITHUB_OUTPUT"
+          echo "versions_json=${VERSIONS_JSON}" >> "$GITHUB_OUTPUT"
 
   create-pr-to-uat:
     name: "Create PR → UAT"
-    needs: [mobile-pipeline, version-test, systems-config]
-    if: always() && github.ref == 'refs/heads/test' && needs.version-test.result == 'success'
-    uses: ImplementSprint/central-workflow/.github/workflows/promotion.yml@main
+    needs: [mobile, version-test, deploy-test, active-systems, prepare-payload]
+    if: >-
+      always() &&
+      github.ref == 'refs/heads/test' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') &&
+      ((github.event_name != 'workflow_dispatch' && github.event_name != 'workflow_call') || inputs.run_promotion == true) &&
+      fromJson(needs.active-systems.outputs.active_count) > 0 &&
+      (needs.mobile.result == 'success' || needs.mobile.result == 'skipped') &&
+      needs.version-test.result == 'success' &&
+      (needs.deploy-test.result == 'success' || needs.deploy-test.result == 'skipped')
+    uses: ./.github/workflows/promotion.yml
     with:
       pipeline-kind: single
       direction: test-to-uat
-      system1-name: ${{ needs.systems-config.outputs.system_name }}
-      version-tag: ${{ needs.version-test.outputs.version_tag }}
-      pipeline-result: success
+      systems-json: ${{ needs.active-systems.outputs.active_systems_json }}
+      deployment-urls-json: ${{ needs.prepare-payload.outputs.deployment_urls_json }}
+      results-json: ${{ needs.prepare-payload.outputs.results_json }}
+      versions-json: ${{ needs.prepare-payload.outputs.versions_json }}
+      tests-status: ${{ needs.mobile.result }}
+      lint-status: ${{ needs.mobile.result }}
+      security-status: ${{ needs.mobile.result }}
+      sonar-status: ${{ needs.mobile.result }}
+      pipeline-result: ${{ (needs.mobile.result == 'success' || needs.mobile.result == 'skipped') && 'success' || (needs.mobile.result == 'cancelled' && 'cancelled' || 'failure') }}
+      dry-run: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.dry_run == true }}
     secrets:
       PR_TOKEN: ${{ secrets.GH_PR_TOKEN }}
 
-  # ══════════════════════════════════════════════════════════════════
-  # Summary & Notifications
-  # ══════════════════════════════════════════════════════════════════
-  pipeline-summary:
-    name: "Pipeline Summary"
-    needs: [mobile-pipeline, systems-config]
-    if: always()
-    uses: ImplementSprint/central-workflow/.github/workflows/pipeline-summary.yml@main
+  create-pr-to-main:
+    name: "Create PR → Main"
+    needs: [mobile, deploy-uat, active-systems, prepare-payload]
+    if: >-
+      always() &&
+      github.ref == 'refs/heads/uat' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') &&
+      ((github.event_name != 'workflow_dispatch' && github.event_name != 'workflow_call') || inputs.run_promotion == true) &&
+      fromJson(needs.active-systems.outputs.active_count) > 0 &&
+      (needs.mobile.result == 'success' || needs.mobile.result == 'skipped') &&
+      (needs.deploy-uat.result == 'success' || needs.deploy-uat.result == 'skipped')
+    uses: ./.github/workflows/promotion.yml
     with:
       pipeline-kind: single
-      system1-name: ${{ needs.systems-config.outputs.system_name }}
-      system1-result: ${{ needs.mobile-pipeline.result }}
+      direction: uat-to-main
+      systems-json: ${{ needs.active-systems.outputs.active_systems_json }}
+      deployment-urls-json: ${{ needs.prepare-payload.outputs.deployment_urls_json }}
+      results-json: ${{ needs.prepare-payload.outputs.results_json }}
+      versions-json: ${{ needs.prepare-payload.outputs.versions_json }}
+      tests-status: ${{ needs.mobile.result }}
+      lint-status: ${{ needs.mobile.result }}
+      security-status: ${{ needs.mobile.result }}
+      sonar-status: ${{ needs.mobile.result }}
+      pipeline-result: ${{ (needs.mobile.result == 'success' || needs.mobile.result == 'skipped') && 'success' || (needs.mobile.result == 'cancelled' && 'cancelled' || 'failure') }}
+      dry-run: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.dry_run == true }}
+    secrets:
+      PR_TOKEN: ${{ secrets.GH_PR_TOKEN }}
+
+  pipeline-summary:
+    name: "Pipeline Summary"
+    needs: [mobile, active-systems]
+    if: always()
+    uses: ./.github/workflows/pipeline-summary.yml
+    with:
+      pipeline-kind: single
+      systems-json: ${{ needs.active-systems.outputs.active_systems_json }}
+      results-json: '{}'
+      overall-result: ${{ needs.mobile.result }}
 
   notify-pipeline:
     name: "Notify Pipeline Status"
-    needs: [pipeline-summary, mobile-pipeline, systems-config]
+    needs: [pipeline-summary, mobile, active-systems, prepare-payload]
     if: always()
-    uses: ImplementSprint/central-workflow/.github/workflows/notifications.yml@main
+    uses: ./.github/workflows/notifications.yml
     with:
-      status: ${{ needs.mobile-pipeline.result }}
-      system-dir: "Mobile Single"
-      pipeline-type: "Mobile Master"
-    secrets: inherit
+      status: ${{ (needs.mobile.result == 'success' || needs.mobile.result == 'skipped') && 'success' || (needs.mobile.result == 'cancelled' && 'cancelled' || 'failure') }}
+      system-dir: ${{ needs.active-systems.outputs.active_label }}
+      pipeline-type: Mobile Single Master
+      error-details: ${{ needs.mobile.result != 'success' && needs.mobile.result != 'skipped' && 'Master mobile single pipeline reported failures.' || '' }}
+      deployment-url: ''
+      deployment-urls-json: ${{ needs.prepare-payload.outputs.deployment_urls_json }}
+      success-image-url: ${{ vars.DISCORD_SUCCESS_IMAGE_URL != '' && vars.DISCORD_SUCCESS_IMAGE_URL || vars.JED_SUCCESS_IMAGE_URL }}
+      failure-image-url: ${{ vars.DISCORD_FAIL_IMAGE_URL != '' && vars.DISCORD_FAIL_IMAGE_URL || vars.JED_FAIL_IMAGE_URL }}
+      cancelled-image-url: ${{ vars.DISCORD_CANCELLED_IMAGE_URL != '' && vars.DISCORD_CANCELLED_IMAGE_URL || vars.JED_CANCELLED_IMAGE_URL }}
+    secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
