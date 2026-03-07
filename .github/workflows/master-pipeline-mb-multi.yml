@@ -68,7 +68,27 @@ permissions:
   security-events: write
 
 jobs:
+  validate-mobile-multi-config:
+    name: "Validate Multi Mobile Systems Config"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure MOBILE_MULTI_SYSTEMS_JSON is configured
+        env:
+          MOBILE_MULTI_SYSTEMS_JSON: ${{ vars.MOBILE_MULTI_SYSTEMS_JSON }}
+        run: |
+          if [ -z "$MOBILE_MULTI_SYSTEMS_JSON" ]; then
+            echo "MOBILE_MULTI_SYSTEMS_JSON is missing."
+            echo "Set repository variable MOBILE_MULTI_SYSTEMS_JSON with system definitions."
+            exit 1
+          fi
+
+          echo "$MOBILE_MULTI_SYSTEMS_JSON" | grep -Eq 'enable_android_build|enable_ios_build' || {
+            echo "MOBILE_MULTI_SYSTEMS_JSON must include enable_android_build and/or enable_ios_build fields."
+            exit 1
+          }
+
   call-orchestrator:
+    needs: validate-mobile-multi-config
     uses: ImplementSprint/central-workflow/.github/workflows/master-pipeline-mobile.yml@main
     with:
       pipeline_mode: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.pipeline_mode || 'multi' }}
